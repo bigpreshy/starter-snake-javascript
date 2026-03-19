@@ -175,25 +175,84 @@ function voronoiScore(gameState) {
   return myCells / totalCells;
 }
 
-// ─── Closest Food Score ───────────────────────────────────────────────────────
+// ─── BFS Food Pathfinding ─────────────────────────────────────────────────────
 
 /**
- * Returns a normalized urgency score for seeking food based on health.
- * Low health → high food urgency.
+ * BFS from `startPos` to find the shortest real path to ANY food.
+ * Returns { dist, firstMove } where firstMove is the direction to take
+ * from startPos to reach the nearest food optimally.
+ * Returns null if no food is reachable.
+ */
+function bfsToFood(startPos, gameState) {
+  const { board } = gameState;
+  const blocked = buildBlockedSet(gameState, true); // tails vacate
+  const foodSet = new Set(board.food.map(f => `${f.x},${f.y}`));
+
+  if (foodSet.size === 0) return null;
+
+  // Queue entries: { pos, firstMove, dist }
+  const visited = new Set([`${startPos.x},${startPos.y}`]);
+  const queue = [];
+
+  // Seed queue with all first moves from startPos
+  for (const dir of DIRECTIONS) {
+    const next = applyMove(startPos, dir);
+    const key = `${next.x},${next.y}`;
+    if (!inBounds(next, board)) continue;
+    if (blocked.has(key)) continue;
+    queue.push({ pos: next, firstMove: dir, dist: 1 });
+    visited.add(key);
+  }
+
+  let qi = 0;
+  while (qi < queue.length) {
+    const { pos, firstMove, dist } = queue[qi++];
+    const key = `${pos.x},${pos.y}`;
+
+    // Found food!
+    if (foodSet.has(key)) {
+      return { dist, firstMove };
+    }
+
+    for (const dir of DIRECTIONS) {
+      const next = applyMove(pos, dir);
+      const nk = `${next.x},${next.y}`;
+      if (!inBounds(next, board)) continue;
+      if (blocked.has(nk)) continue;
+      if (visited.has(nk)) continue;
+      visited.add(nk);
+      queue.push({ pos: next, firstMove, dist: dist + 1 });
+    }
+  }
+
+  return null; // no food reachable
+}
+
+/**
+ * Returns a food score for the evaluator.
+ * - Always active (not just when starving)
+ * - Based on real BFS distance, not Manhattan
+ * - Scaled by health urgency so it intensifies as health drops
  */
 function foodScore(gameState) {
-  const { food, snakes } = gameState.board;
   const me = gameState.you;
   const myHead = me.body[0];
+  const { board } = gameState;
 
-  if (food.length === 0) return 0;
+  if (board.food.length === 0) return 0;
 
-  const closestDist = Math.min(...food.map(f => manhattan(myHead, f)));
-  // Normalize: closer food = better, but scale by health urgency
-  const healthUrgency = 1 - me.health / 100;
-  const distScore = Math.max(0, 1 - closestDist / (gameState.board.width + gameState.board.height));
+  const result = bfsToFood(myHead, gameState);
+  if (!result) return 0;
 
-  return healthUrgency * distScore;
+  const maxDist = board.width + board.height;
+
+  // Base score: always reward being close to food (not just when starving)
+  const distScore = Math.max(0, 1 - result.dist / maxDist);
+
+  // Urgency multiplier: ramps from 1.0 (full health) to 3.0 (near death)
+  const healthUrgency = 1 + 2 * (1 - me.health / 100);
+
+  return distScore * healthUrgency;
 }
 
 // ─── State Evaluation ─────────────────────────────────────────────────────────
@@ -231,13 +290,17 @@ function evaluate(gameState) {
   // Survival: heavily penalise tiny space
   const survivalPenalty = space < me.length ? -500 : 0;
 
+  // Critical health penalty — ramp up food priority sharply below 30hp
+  const healthPenalty = me.health < 30 ? (me.health - 30) * 10 : 0;
+
   return (
-    spaceRatio    * 300  +
-    territory     * 400  +
-    lengthAdvantage * 50 +
-    food          * 150  +
-    (me.health / 100) * 50 +
-    survivalPenalty
+    spaceRatio      * 200  +
+    territory       * 250  +
+    lengthAdvantage * 40   +
+    food            * 400  +  // food is now the dominant signal
+    (me.health / 100) * 80 +
+    survivalPenalty        +
+    healthPenalty
   );
 }
 
@@ -554,6 +617,32 @@ function move(gameState) {
   });
 
   const candidateMoves = h2hSafe.length > 0 ? h2hSafe : safeMoves;
+
+  // ── Step 3.5: BFS food override ───────────────────────────────────────────
+  // If we have a direct BFS path to food AND that first move is in our
+  // candidate set, force it as the only candidate when health is low OR
+  // we're shorter than the longest opponent (need to grow).
+  // This ensures the snake ALWAYS hunts food, not just when evaluator nudges it.
+
+  const foodPath = bfsToFood(myHead, gameState);
+  const longestOpponentLen = opponents.length > 0
+    ? Math.max(...opponents.map(s => s.length))
+    : 0;
+
+  const shouldChaseFood =
+    me.health < 60 ||                    // getting hungry
+    me.length <= longestOpponentLen ||    // need to grow to compete
+    me.health < 100;                      // always eat if not full
+
+  if (foodPath && shouldChaseFood && candidateMoves.includes(foodPath.firstMove)) {
+    // Only override if the food move is genuinely safe (flood fill passes)
+    const foodNext = applyMove(myHead, foodPath.firstMove);
+    const foodSpace = floodFill(foodNext, gameState);
+    if (foodSpace >= me.length * FLOOD_FILL_SAFETY_RATIO) {
+      console.log(`MOVE ${gameState.turn}: Food BFS override → ${foodPath.firstMove} (dist: ${foodPath.dist}, health: ${me.health})`);
+      return { move: foodPath.firstMove };
+    }
+  }
 
   // ── Step 4: Minimax search ────────────────────────────────────────────────
 
