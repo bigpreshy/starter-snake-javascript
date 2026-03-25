@@ -22,9 +22,9 @@ const FLOOD_FILL_SAFETY_RATIO = 0.5;
 function info() {
   console.log("INFO");
   return {
-    apiversion: "2, live",
+    apiversion: "v3",
     author: "",
-    color: "#1a1a2e",
+    color: "#ef9b0b",
     head: "default",
     tail: "default",
   };
